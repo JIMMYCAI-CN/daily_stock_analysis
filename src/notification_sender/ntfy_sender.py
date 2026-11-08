@@ -17,6 +17,43 @@ from src.formatters import strip_hidden_markdown_metadata
 logger = logging.getLogger(__name__)
 
 
+# ntfy.sh free tier caps a single message at roughly 4 KiB. A full decision
+# dashboard is much larger, so the publisher splits it into readable chunks at
+# line boundaries (HTTP 413 otherwise: "JSON body too large").
+def _split_ntfy_content(content: str, max_bytes: int = 3500):
+    """Split UTF-8 text into chunks whose encoded size stays below max_bytes."""
+    if len(content.encode("utf-8")) <= max_bytes:
+        return [content]
+    chunks = []
+    current = []
+    current_size = 0
+    for line in content.splitlines(keepends=True):
+        line_size = len(line.encode("utf-8"))
+        if line_size > max_bytes:
+            if current:
+                chunks.append("".join(current))
+                current, current_size = [], 0
+            buf, buf_size = [], 0
+            for char in line:
+                char_size = len(char.encode("utf-8"))
+                if buf_size + char_size > max_bytes and buf:
+                    chunks.append("".join(buf))
+                    buf, buf_size = [], 0
+                buf.append(char)
+                buf_size += char_size
+            current, current_size = buf, buf_size
+            continue
+        if current_size + line_size > max_bytes and current:
+            chunks.append("".join(current))
+            current, current_size = [line], line_size
+        else:
+            current.append(line)
+            current_size += line_size
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
 def resolve_ntfy_endpoint(ntfy_url: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """Split NTFY_URL into server root and topic from the final path segment."""
     raw_url = (ntfy_url or "").strip().rstrip("/")
@@ -92,36 +129,42 @@ class NtfySender:
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
-        payload = {
-            "topic": topic,
-            "title": title,
-            "message": sanitized_content,
-            "markdown": True,
-        }
-
-        try:
-            response = requests.post(
-                server_url,
-                json=payload,
-                headers=headers,
-                timeout=timeout_seconds or 10,
-                verify=self._webhook_verify_ssl,
-            )
-            if 200 <= response.status_code < 300:
-                logger.info("ntfy 消息发送成功")
-                return True
-
-            logger.error("ntfy 请求失败: HTTP %s", response.status_code)
-            logger.debug("ntfy 响应内容: %s", response.text)
-            return False
-        except requests.exceptions.Timeout:
-            logger.error("发送 ntfy 消息失败: 请求超时")
-            return False
-        except requests.exceptions.RequestException as exc:
-            logger.error("发送 ntfy 消息失败: 网络请求异常")
-            logger.debug("ntfy 请求异常类型: %s", type(exc).__name__)
-            return False
-        except Exception as exc:
-            logger.error("发送 ntfy 消息失败: 未知异常")
-            logger.debug("ntfy 未知异常类型: %s", type(exc).__name__)
-            return False
+        chunks = _split_ntfy_content(sanitized_content)
+        total = len(chunks)
+        if total > 1:
+            logger.info("ntfy 内容较长，将分 %s 段发送", total)
+        all_ok = True
+        for index, chunk in enumerate(chunks, 1):
+            chunk_title = title if total == 1 else f"{title} ({index}/{total})"
+            payload = {
+                "topic": topic,
+                "title": chunk_title,
+                "message": chunk,
+                "markdown": True,
+            }
+            try:
+                response = requests.post(
+                    server_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout_seconds or 10,
+                    verify=self._webhook_verify_ssl,
+                )
+                if 200 <= response.status_code < 300:
+                    logger.info("ntfy 消息发送成功 (%s/%s)", index, total)
+                    continue
+                logger.error("ntfy 请求失败: HTTP %s", response.status_code)
+                logger.debug("ntfy 响应内容: %s", response.text)
+                all_ok = False
+            except requests.exceptions.Timeout:
+                logger.error("发送 ntfy 消息失败: 请求超时")
+                all_ok = False
+            except requests.exceptions.RequestException as exc:
+                logger.error("发送 ntfy 消息失败: 网络请求异常")
+                logger.debug("ntfy 请求异常类型: %s", type(exc).__name__)
+                all_ok = False
+            except Exception as exc:
+                logger.error("发送 ntfy 消息失败: 未知异常")
+                logger.debug("ntfy 未知异常类型: %s", type(exc).__name__)
+                all_ok = False
+        return all_ok
